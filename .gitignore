@@ -1,0 +1,26 @@
+.venv/
+__pycache__/
+build/
+
+# Brother downloads, extracted vendor files, and locally repackaged drivers.
+/drivers/
+*.rpm
+*.deb
+*.tar
+*.tar.gz
+*.tgz
+*.tar.xz
+*.zip
+*.cpio
+*.ppd
+/cupswrapper-*/
+/opt/
+
+# Local labels, credentials, logs, and editor/agent state.
+/label_images/
+.env
+.env.*
+*.log
+.agents/
+.codex/
+.vscode/

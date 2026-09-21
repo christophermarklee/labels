@@ -1,0 +1,17 @@
+[project]
+name = "labels"
+version = "0.1.0"
+description = "A tiny local label editor and CUPS printing app for the Brother QL-810W"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "brother-ql>=0.9.4",
+    "fastapi>=0.141.1",
+    "pillow>=12.3.0",
+    "uvicorn>=0.53.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+]
