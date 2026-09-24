@@ -20,7 +20,14 @@
   .preview img { width:100%; height:auto; box-shadow:0 6px 18px #20302518; border-radius:3px; }
   .preview img[hidden] { display:none; } .caption { font-size:13px; color:#637067; margin:12px 0; }
   #status { min-height:48px; line-height:1.5; font-size:14px; } .error { color:#a33424; }
-  .actions { display:flex; align-items:center; gap:12px; } #refresh { font-size:13px; padding:8px; }
+  .actions { display:flex; flex-wrap:wrap; align-items:center; gap:12px; } #refresh { font-size:13px; padding:8px; }
+  .queue { border-top:1px solid #cbd1c6; margin-top:12px; padding-top:18px; }
+  .queue h2 { font-size:16px; margin:0 0 6px; }
+  #queue-printer { white-space:pre-wrap; overflow-wrap:anywhere; font-size:13px; line-height:1.5; }
+  .queue table { width:100%; border-collapse:collapse; font-size:13px; table-layout:fixed; }
+  .queue th,.queue td { text-align:left; padding:9px 5px; border-bottom:1px solid #dce1d6; overflow-wrap:anywhere; }
+  .queue th:first-child { width:54%; } .queue th:last-child { width:22%; }
+  #queue-summary { margin:12px 0; }
   @media(max-width:650px) { main { margin-top:28px; } .layout { grid-template-columns:1fr; gap:20px; } header { flex-wrap:wrap; } }
 </style>
 <main>
@@ -32,13 +39,14 @@
       <p class="hint">Enter for a new line. Text shrinks to fit.</p>
       <label for="size">Label roll / size</label>
       <select id="size">
+        <option value="62-4in">62 mm black-on-white · 4 inches long (101.6 mm)</option>
+        <option value="62X1">62 mm black-on-white · 100 mm long</option>
         <option value="62red">62 mm black/red roll · 100 mm long</option>
-        <option value="62X1">62 mm continuous · 100 mm long</option>
         <option value="29X1">29 mm continuous · 100 mm long</option>
         <option value="29x90">29 × 90 mm · die-cut</option>
         <option value="62x100">62 × 100 mm · die-cut</option>
       </select>
-      <p class="hint">Match the roll loaded in your printer.</p>
+      <p class="hint">Match the roll loaded in your printer. Your selection is remembered.</p>
       <div class="row">
         <div><label for="align">Alignment</label><select id="align"><option value="center">Center</option><option value="left">Left</option></select></div>
         <div><label for="font_size">Text size (pt)</label><input id="font_size" type="number" min="8" max="72" value="24"></div>
@@ -47,8 +55,18 @@
         <div style="flex:3"><label for="printer">Printer</label><select id="printer"><option value="">Loading…</option></select></div>
         <div><label for="copies">Copies</label><input id="copies" type="number" min="1" max="20" value="1"></div>
       </div>
-      <div class="actions"><button id="print" disabled>Print label</button><button id="refresh">Refresh printers</button></div>
+      <div class="actions"><button id="print" disabled>Print label</button><button id="cancel" disabled title="Cancel your active and queued jobs on the selected printer">Cancel print</button><button id="refresh">Refresh printers</button></div>
       <p id="status" role="status" aria-live="polite"></p>
+      <section class="queue" aria-labelledby="queue-heading">
+        <h2 id="queue-heading">Print queue</h2>
+        <span class="caption">Selected printer · updates every 3 seconds</span>
+        <p id="queue-printer"></p>
+        <p id="queue-summary" class="hint" role="status">Select a printer to see its queue.</p>
+        <table id="queue-table" hidden aria-label="Active and queued print jobs">
+          <thead><tr><th scope="col">Job</th><th scope="col">Owner</th><th scope="col">Size</th></tr></thead>
+          <tbody id="queue-jobs"></tbody>
+        </table>
+      </section>
     </section>
     <section aria-label="Label preview">
       <div class="preview"><img id="preview" alt="Your label preview" hidden><span id="placeholder">Preparing preview…</span></div>
@@ -59,9 +77,21 @@
 </main>
 <script>
   const $ = id => document.getElementById(id);
-  let timer, sequence=0, imageURL, valid=false, printing=false;
+  const rollStorageKey='labels.roll';
+  try {
+    const saved=localStorage.getItem(rollStorageKey);
+    if([...$('size').options].some(option=>option.value===saved)) $('size').value=saved;
+  } catch {} // The editor also works when browser storage is unavailable.
+  let timer, sequence=0, imageURL, valid=false, printing=false, canceling=false, loadingPrinters=false;
+  let queueTimer, queueController, queueSequence=0;
   const payload=()=>({text:$('text').value,size:$('size').value,align:$('align').value,font_size:Number($('font_size').value)});
-  const updateButton=()=> $('print').disabled=printing || !valid || !$('printer').value || !$('copies').checkValidity();
+  function updateButton() {
+    const busy=printing || canceling || loadingPrinters;
+    $('print').disabled=busy || !valid || !$('printer').value || !$('copies').checkValidity();
+    $('cancel').disabled=busy || !$('printer').value;
+    $('printer').disabled=busy;
+    $('refresh').disabled=busy;
+  }
   function status(message,error=false) { $('status').textContent=message; $('status').className=error?'error':''; }
   async function checked(response) {
     if(!response.ok) {
@@ -69,6 +99,49 @@
       throw new Error(typeof data.detail==='string' ? data.detail : data.detail?.[0]?.msg || 'Request failed.');
     }
     return response;
+  }
+  function stopQueue() {
+    clearTimeout(queueTimer); queueController?.abort(); queueController=null;
+    ++queueSequence;
+  }
+  function clearQueue(message) {
+    $('queue-jobs').replaceChildren(); $('queue-table').hidden=true;
+    $('queue-printer').textContent=''; $('queue-summary').textContent=message;
+    $('queue-summary').className='hint';
+  }
+  async function refreshQueue(clear=false) {
+    stopQueue();
+    const current=queueSequence, printer=$('printer').value;
+    if(!printer) { clearQueue('Select a printer to see its queue.'); return; }
+    if(document.hidden || loadingPrinters) return;
+    if(clear) clearQueue('Loading queue…');
+    const controller=new AbortController(); queueController=controller;
+    try {
+      const response=await checked(await fetch(`/api/queue?printer=${encodeURIComponent(printer)}`,{cache:'no-store',signal:controller.signal}));
+      const data=await response.json();
+      if(current!==queueSequence) return;
+      const rows=data.jobs.map(job=>{
+        const row=document.createElement('tr');
+        row.title=`Submitted: ${job.submitted}`;
+        for(const value of [job.id,job.owner,`${Math.ceil(job.bytes/1024)} KB`]) {
+          const cell=document.createElement('td'); cell.textContent=value; row.append(cell);
+        }
+        return row;
+      });
+      $('queue-jobs').replaceChildren(...rows); $('queue-table').hidden=!rows.length;
+      $('queue-printer').textContent=data.status;
+      const message=rows.length ? `${rows.length} active / queued ${rows.length===1?'job':'jobs'}.` : 'No active or queued jobs.';
+      if($('queue-summary').textContent!==message) $('queue-summary').textContent=message;
+      $('queue-summary').className='hint';
+    } catch(error) {
+      if(current!==queueSequence || error.name==='AbortError') return;
+      clearQueue(`Queue unavailable: ${error.message}`); $('queue-summary').className='hint error';
+    } finally {
+      if(current===queueSequence) {
+        queueController=null;
+        queueTimer=setTimeout(()=>refreshQueue(),3000);
+      }
+    }
   }
   function schedulePreview() {
     valid=false; updateButton(); clearTimeout(timer);
@@ -92,7 +165,7 @@
     },200);
   }
   async function loadPrinters() {
-    $('refresh').disabled=true;
+    loadingPrinters=true; updateButton(); stopQueue(); clearQueue('Loading printers…');
     try {
       const data=await (await checked(await fetch('/api/printers'))).json();
       const previous=$('printer').value;
@@ -104,18 +177,33 @@
         status('Add the Brother printer in CUPS, then refresh printers.',true);
       } else status('Ready.');
     } catch(error) { $('printer').replaceChildren(new Option('Printer unavailable','')); status(error.message,true); }
-    $('refresh').disabled=false; updateButton();
+    loadingPrinters=false; updateButton(); refreshQueue(true);
   }
   for(const id of ['text','size','align','font_size']) $(id).addEventListener('input',schedulePreview);
-  $('printer').addEventListener('change',updateButton); $('copies').addEventListener('input',updateButton);
+  $('size').addEventListener('change',()=>{
+    try { localStorage.setItem(rollStorageKey,$('size').value); } catch {}
+  });
+  $('printer').addEventListener('change',()=>{updateButton(); refreshQueue(true);}); $('copies').addEventListener('input',updateButton);
+  document.addEventListener('visibilitychange',()=>{if(document.hidden) stopQueue(); else refreshQueue();});
+  window.addEventListener('pagehide',stopQueue);
+  window.addEventListener('pageshow',()=>refreshQueue());
   $('refresh').addEventListener('click',loadPrinters);
+  $('cancel').addEventListener('click',async()=>{
+    const printer=$('printer').value;
+    canceling=true; updateButton(); status('Canceling print jobs…');
+    try {
+      const response=await checked(await fetch('/api/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({printer})}));
+      const data=await response.json(); status(data.message);
+    } catch(error) { status(error.message,true); }
+    canceling=false; updateButton(); refreshQueue();
+  });
   $('print').addEventListener('click',async()=>{
     printing=true; updateButton(); status('Sending label…');
     try {
       const response=await checked(await fetch('/api/print',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...payload(),printer:$('printer').value,copies:Number($('copies').value)})}));
       const data=await response.json(); status(data.job_id ? `Queued as ${data.job_id}.` : data.message);
     } catch(error) { status(error.message,true); }
-    printing=false; updateButton();
+    printing=false; updateButton(); refreshQueue();
   });
   schedulePreview(); loadPrinters();
 </script>

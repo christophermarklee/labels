@@ -1,5 +1,6 @@
 """Local text labels: uv run python main.py."""
 from functools import lru_cache
+import getpass
 from io import BytesIO
 import os
 from pathlib import Path
@@ -7,20 +8,20 @@ import re
 import subprocess
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel, Field, field_validator
 
 app = FastAPI(title="Labels")
 DPI = 300
-# Brother PPD identifiers: roll width, label length (mm).
-SIZES = {"29x90": (29, 90), "62x100": (62, 100), "29X1": (29, 100), "62X1": (62, 100), "62red": (62, 100)}
+# Roll width and label length (mm); raster sizes bypass the fixed PPD sizes.
+SIZES = {"29x90": (29, 90), "62x100": (62, 100), "29X1": (29, 100), "62X1": (62, 100), "62red": (62, 100), "62-4in": (62, 101.6)}
 
 
 class Label(BaseModel):
     text: str = Field(min_length=1, max_length=800)
-    size: Literal["29x90", "62x100", "29X1", "62X1", "62red"] = "62red"
+    size: Literal["29x90", "62x100", "29X1", "62X1", "62red", "62-4in"] = "62-4in"
     align: Literal["left", "center"] = "center"
     font_size: int = Field(default=24, ge=8, le=72)
 
@@ -40,6 +41,10 @@ class PrintLabel(Label):
     copies: int = Field(default=1, ge=1, le=20)
 
 
+class CancelPrint(BaseModel):
+    printer: str = Field(min_length=1, max_length=127, pattern=r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
+
+
 @app.middleware("http")
 async def local_requests(request: Request, call_next):
     # Prevent other websites from submitting jobs to this local app.
@@ -57,7 +62,7 @@ def command(args: list[str], data: bytes | None = None) -> str:
         result = subprocess.run(args, input=data, capture_output=True, timeout=15,
                                 env={**os.environ, "LC_ALL": "C"})
     except FileNotFoundError as exc:
-        raise HTTPException(503, "Install CUPS client tools (lp and lpstat).") from exc
+        raise HTTPException(503, "Install CUPS client tools (lp, lpstat, and cancel).") from exc
     except subprocess.TimeoutExpired as exc:
         raise HTTPException(504, "CUPS timed out. Check the queue before retrying.") from exc
     if result.returncode:
@@ -109,11 +114,36 @@ def printers():
     return {"printers": command(["lpstat", "-e"]).splitlines()}
 
 
+@app.get("/api/queue")
+def print_queue(printer: str = Query(min_length=1, max_length=127, pattern=r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")):
+    printer_status = command(["lpstat", "-p", printer])
+    listing = command(["lpstat", "-W", "not-completed", "-o", printer])
+    jobs = []
+    for line in listing.splitlines():
+        fields = line.split(maxsplit=3)
+        if (len(fields) != 4 or not fields[2].isdigit()
+                or not re.fullmatch(re.escape(printer) + r"-\d+", fields[0], flags=re.IGNORECASE)):
+            raise HTTPException(502, "Could not read the CUPS queue response.")
+        jobs.append({"id": fields[0], "owner": fields[1], "bytes": int(fields[2]), "submitted": fields[3]})
+    return JSONResponse({"printer": printer, "status": printer_status, "jobs": jobs},
+                        headers={"Cache-Control": "no-store"})
+
+
 @app.post("/api/preview")
 def preview(label: Label):
     output = BytesIO()
     render(label).save(output, format="PNG")
     return Response(output.getvalue(), media_type="image/png", headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/cancel")
+def cancel_print(job: CancelPrint):
+    if job.printer not in printers()["printers"]:
+        raise HTTPException(422, "Select an existing CUPS printer. Refresh the printer list.")
+    # Limit cancellation to this user's jobs on this queue, including jobs from
+    # before a page reload. Never invoke cancel without an explicit destination.
+    command(["cancel", "-a", "-u", getpass.getuser(), job.printer])
+    return {"message": f"Cancellation requested for your jobs on {job.printer}. A label already printing may finish."}
 
 
 @app.post("/api/print")
@@ -122,7 +152,7 @@ def print_label(label: PrintLabel):
         raise HTTPException(422, "Select an existing CUPS printer. Refresh the printer list.")
     image = render(label).transpose(Image.Transpose.ROTATE_90)
     args = ["lp", "-d", label.printer, "-n", str(label.copies), "-t", "Label", "-o", "job-sheets=none"]
-    if label.size == "62red":
+    if label.size in {"62red", "62-4in"}:
         from brother_ql.conversion import convert
         from brother_ql.raster import BrotherQLRaster
         # 696 printable dots across; the printer supplies 35 feed dots at each end.
@@ -130,7 +160,8 @@ def print_label(label: PrintLabel):
         image = image.crop((18, 35, 714, image.height - 35)).convert("RGB")
         raster = BrotherQLRaster("QL-810W")
         raster.exception_on_warning = True
-        data = convert(raster, [image], "62red", red=True, rotate=0, cut=True)
+        red = label.size == "62red"
+        data = convert(raster, [image], "62red" if red else "62", red=red, rotate=0, cut=True)
         args += ["-o", "raw"]
     else:
         output = BytesIO()

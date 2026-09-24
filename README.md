@@ -12,13 +12,26 @@ Open **http://127.0.0.1:8000**. Choose the loaded roll, type a label, and click
 same monochrome 300 dpi render. Printing submits to CUPS and reports the job ID;
 a queued job does not mean physical printing has completed.
 
-The default is **62 mm continuous tape, cut at 100 mm** for the supplied black/red
-on white sample roll. This version produces black text only. It also offers 29 mm
+Use **Cancel print** to cancel your active and queued jobs on the selected
+printer, including jobs submitted before reloading the page. This affects your
+jobs from other applications on that printer too. A label already transferred
+to the printer may still finish; cancellation cannot undo printed output.
+
+The **Print queue** panel shows the selected printer's CUPS status and active
+jobs (ID, owner, and size). It updates every three seconds while the tab is
+visible, and immediately after printing or canceling. CUPS errors are shown and
+retried automatically. Completed/canceled jobs disappear; an empty queue alone
+does not confirm that the physical label printed successfully.
+
+The default is **62 mm black-on-white continuous tape, cut at 4 inches (101.6 mm)** (DK-2205
+or equivalent). The browser remembers your selected roll across reloads. This
+version produces black text only. It also offers 62 mm black-on-white at 100 mm, 29 mm
 continuous tape at 100 mm, and 29 × 90 / 62 × 100 mm die-cut labels. Arbitrary cut
 lengths and red text are not implemented. Choose **62 mm black/red roll** for this
 sample roll: even black-only text requires two-color mode. The app uses
 `brother-ql` to generate black and empty red raster planes, sent through CUPS with
-`-o raw` so the monochrome vendor filter does not alter them. Other roll choices
+`-o raw` so the monochrome vendor filter does not alter them. The 4-inch option
+also uses raw raster data, in black-only mode, to set the exact feed length. Other roll choices
 use a correctly sized PDF through the vendor driver. This targets CUPS 2.x.
 
 ## Printer setup
@@ -75,7 +88,7 @@ Click **Refresh printers** in the app. Use `lpstat -p` and `lpstat -o` to check
 printer/job status, or `cancel JOB_ID` to cancel a queued job. The app itself runs
 as your normal user, with no sudo. Keep it on localhost; it has no user accounts.
 
-System requirements: the Brother driver, CUPS client commands (`lp`, `lpstat`),
+System requirements: the Brother driver, CUPS client commands (`lp`, `lpstat`, `cancel`),
 and fontconfig with a sans font. `LABEL_FONT=/path/to/font.ttf` overrides the font.
 
 ## Checks
@@ -85,7 +98,7 @@ uv run python -m unittest -v
 ```
 
 Tests cover image dimensions/margins, PDF page size, black/red raster planes, print options, invalid
-input, missing printers, CUPS errors, and cross-site print rejection. Print
+input, missing printers, CUPS errors, scoped cancellation, and cross-site request rejection. Print
 submission is mocked in these tests, so they use no paper. Physical printing has
 also been confirmed on a USB-connected QL-810W with the 62 mm black/red sample
 roll on RHEL 10.2.
